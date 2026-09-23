@@ -1,0 +1,44 @@
+# Construit Messagerie.exe et publie une nouvelle version (Release) à chaque
+# commit qui modifie l'application. Les applis installées la détectent toutes seules.
+name: Publier une nouvelle version
+
+on:
+  push:
+    branches: [main]
+    paths: ["messagerie/client/**"]
+  workflow_dispatch:        # bouton "Run workflow" pour lancer à la main
+
+permissions:
+  contents: write           # nécessaire pour créer la Release
+
+jobs:
+  construire:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: messagerie/client
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer les dépendances
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Écrire le numéro de version
+        run: echo 'VERSION = "${{ github.run_number }}"' > version.py
+
+      - name: Construire Messagerie.exe
+        run: python -m PyInstaller --onefile --windowed --name Messagerie --collect-all customtkinter app.py
+
+      - name: Publier la Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Version ${{ github.run_number }}
+          body: ${{ github.event.head_commit.message || 'Nouvelle version' }}
+          files: messagerie/client/dist/Messagerie.exe
+          make_latest: true
