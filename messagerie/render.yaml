@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: messagerie-relais
+    runtime: python
+    plan: free
+    rootDir: serveur
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
