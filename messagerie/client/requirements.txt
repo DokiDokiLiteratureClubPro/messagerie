@@ -1,3 +1,5 @@
 websockets>=13.0
 pynacl>=1.5
 sounddevice>=0.4
+numpy>=1.24
+customtkinter>=5.2,<6

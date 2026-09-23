@@ -22,6 +22,9 @@ from websockets.asyncio.server import serve, ServerConnection
 from websockets.exceptions import ConnectionClosed
 
 PORT = int(os.environ.get("PORT", "8765"))
+# Doit être identique à PROTOCOLE dans client/noyau.py.
+# Les applis qui ne parlent pas cette version sont refusées avec un message de mise à jour.
+PROTOCOLE = 2
 NOM_VALIDE = re.compile(r"^[A-Za-z0-9_\-]{2,20}$")
 MAX_EN_ATTENTE = 200          # messages gardés pour un utilisateur hors ligne
 TYPES_MEMORISABLES = {"msg"}  # l'audio et les appels ne sont jamais mis en attente
@@ -60,6 +63,11 @@ async def gerer_client(ws: ServerConnection):
         premier = json.loads(await asyncio.wait_for(ws.recv(), timeout=20))
         if premier.get("type") != "hello":
             await ws.send(json.dumps({"type": "error", "msg": "Présentation attendue."}))
+            return
+        if premier.get("protocole") != PROTOCOLE:
+            await ws.send(json.dumps({"type": "error", "code": "maj",
+                                      "msg": "Ton application n'est plus à jour : "
+                                             "installe la nouvelle version pour te connecter."}))
             return
         nom = str(premier.get("user", ""))
         pubkey = str(premier.get("pubkey", ""))

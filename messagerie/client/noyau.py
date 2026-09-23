@@ -32,11 +32,18 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
 from nacl.public import PrivateKey, PublicKey, Box
 from nacl.exceptions import CryptoError
 from websockets.asyncio.client import connect
 
 DOSSIER = Path.home() / ".messagerie"
+
+# Version du "langage" parlé entre l'appli et le serveur.
+# À augmenter UNIQUEMENT quand un changement rend les anciennes versions incompatibles
+# (mettre la même valeur dans serveur/server.py) : le serveur refusera alors les
+# anciennes applis et leur demandera de se mettre à jour.
+PROTOCOLE = 2
 
 # Paramètres audio : 16 kHz mono, paquets de 20 ms
 FREQ = 16000
@@ -64,31 +71,56 @@ def code_securite(cle_a: bytes, cle_b: bytes) -> str:
 # --------------------------------------------------------------------------
 # Audio (le module sounddevice n'est chargé qu'au moment d'un appel)
 # --------------------------------------------------------------------------
+def appliquer_gain(pcm: bytes, gain: float):
+    """Multiplie le volume d'un paquet audio 16 bits, sans saturer (écrêtage)."""
+    echantillons = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    if gain != 1.0:
+        echantillons *= gain
+        np.clip(echantillons, -32768, 32767, out=echantillons)
+    niveau = float(np.abs(echantillons).max()) / 32768 if echantillons.size else 0.0
+    return echantillons.astype(np.int16).tobytes(), niveau
+
+
 class FluxAudio:
-    def __init__(self, envoyer_pcm):
+    """
+    gain_micro : 0.0 à 3.0  (1.0 = inchangé) — ce que l'autre entend de toi
+    volume     : 0.0 à 3.0  (1.0 = inchangé) — le volume de l'autre dans tes oreilles
+    niveau_micro / niveau_contact : 0.0 à 1.0, pour les vu-mètres
+    """
+
+    def __init__(self, envoyer_pcm, gain_micro=1.0, volume=1.0):
         import sounddevice as sd   # import tardif : les messages marchent même sans micro
         self.envoyer_pcm = envoyer_pcm
         self.recus = collections.deque()
         self.pret = False
         self.muet = False
+        self.gain_micro = gain_micro
+        self.volume = volume
+        self.niveau_micro = 0.0
+        self.niveau_contact = 0.0
         self.flux = sd.RawStream(samplerate=FREQ, blocksize=TAILLE_BLOC, dtype="int16",
                                  channels=1, callback=self._rappel)
         self.flux.start()
 
     def _rappel(self, entree, sortie, nb, _temps, _statut):
         # Micro -> réseau
-        if not self.muet:
-            self.envoyer_pcm(bytes(entree))
+        if self.muet:
+            self.niveau_micro = 0.0
+        else:
+            pcm, self.niveau_micro = appliquer_gain(bytes(entree), self.gain_micro)
+            self.envoyer_pcm(pcm)
         # Réseau -> haut-parleur
         while len(self.recus) > TAMPON_MAX:
             self.recus.popleft()
         if not self.pret and len(self.recus) >= TAMPON_DEPART:
             self.pret = True
         if self.pret and self.recus:
-            paquet = self.recus.popleft()
             besoin = len(sortie)
-            sortie[:] = paquet[:besoin].ljust(besoin, b"\x00")
+            paquet = self.recus.popleft()[:besoin].ljust(besoin, b"\x00")
+            paquet, self.niveau_contact = appliquer_gain(paquet, self.volume)
+            sortie[:] = paquet
         else:
+            self.niveau_contact = 0.0
             if not self.recus:
                 self.pret = False      # tampon vide : on ré-accumule avant de rejouer
             sortie[:] = b"\x00" * len(sortie)
@@ -114,8 +146,10 @@ class Messagerie:
     message, cle_changee, appel.
     """
 
-    def __init__(self, url: str, pseudo: str, evenement):
+    def __init__(self, url: str, pseudo: str, evenement, gain_micro=1.0, volume=1.0):
         self.url = url
+        self.gain_micro = gain_micro
+        self.volume = volume
         self.pseudo = pseudo
         self.evenement = evenement
         DOSSIER.mkdir(parents=True, exist_ok=True)
@@ -217,10 +251,12 @@ class Messagerie:
                 async with connect(self.url, open_timeout=90, max_size=256 * 1024,
                                    ping_interval=20, ping_timeout=20) as ws:
                     await ws.send(json.dumps({"type": "hello", "user": self.pseudo,
-                                              "pubkey": b64(self.ma_cle_pub)}))
+                                              "pubkey": b64(self.ma_cle_pub),
+                                              "protocole": PROTOCOLE}))
                     reponse = json.loads(await ws.recv())
                     if reponse.get("type") == "error":
-                        self.evenement({"type": "fatal", "msg": reponse.get("msg")})
+                        self.evenement({"type": "fatal", "msg": reponse.get("msg"),
+                                        "maj": reponse.get("code") == "maj"})
                         return
                     self.ws = ws
                     attente = 2
@@ -324,6 +360,21 @@ class Messagerie:
             self._signal(self.appel["avec"], "fin")
             self._fin_appel("Appel terminé")
 
+    def regler_gain_micro(self, valeur: float):
+        self.gain_micro = valeur
+        if self.appel and self.appel.get("audio"):
+            self.appel["audio"].gain_micro = valeur
+
+    def regler_volume(self, valeur: float):
+        self.volume = valeur
+        if self.appel and self.appel.get("audio"):
+            self.appel["audio"].volume = valeur
+
+    def niveaux(self):
+        """(niveau micro, niveau contact) entre 0 et 1, pour les vu-mètres."""
+        audio = self.appel.get("audio") if self.appel else None
+        return (audio.niveau_micro, audio.niveau_contact) if audio else (0.0, 0.0)
+
     def basculer_muet(self) -> bool:
         if self.appel and self.appel.get("audio"):
             self.appel["audio"].muet = not self.appel["audio"].muet
@@ -354,7 +405,7 @@ class Messagerie:
             if c:
                 self._envoyer({"type": "send", "to": nom, "kind": "audio", "data": {"c": c}})
         try:
-            self.appel["audio"] = FluxAudio(envoyer_pcm)
+            self.appel["audio"] = FluxAudio(envoyer_pcm, self.gain_micro, self.volume)
         except Exception as e:
             self._signal(nom, "fin")
             self._fin_appel(f"Micro / haut-parleur indisponible : {e}")
