@@ -3,6 +3,6 @@ services:
     name: messagerie-relais
     runtime: python
     plan: free
-    rootDir: serveur
+    rootDir: messagerie/serveur
     buildCommand: pip install -r requirements.txt
     startCommand: python server.py
